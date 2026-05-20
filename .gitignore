@@ -18,3 +18,8 @@ outputs/
 .idea/
 .vscode/
 .DS_Store
+
+.claude/
+~$*.docx
+*.tmp
+
