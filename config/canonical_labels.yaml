@@ -1,0 +1,189 @@
+# Canonical chart of accounts used by the Canonical Mapper agent.
+# Each entry: canonical key, applicable profiles, and rule-based synonyms.
+# Synonyms are matched case-insensitively; embedding similarity is used when rules miss.
+
+canonical_lines:
+
+  # ------------------- Revenue / income side -------------------
+  - canonical: revenue.total
+    profiles: [corporate, financial]
+    synonyms:
+      - revenue
+      - total revenue
+      - sales revenue
+      - revenue from continuing operations
+      - revenue from contracts with customers
+      - total revenue, net of interest and dividend expenses
+      - operating income
+      - total income
+
+  - canonical: revenue.interest_income
+    profiles: [financial]
+    synonyms:
+      - interest income
+      - interest revenue
+      - net interest income
+
+  - canonical: revenue.fee_income
+    profiles: [financial]
+    synonyms:
+      - advisory fees
+      - brokerage and other commissions
+      - fee and commission income
+      - management fee income
+
+  - canonical: revenue.trading_income
+    profiles: [financial]
+    synonyms:
+      - net trading income
+      - trading income
+      - dividend income - trading securities
+
+  # ------------------- Cost / expense side -------------------
+  - canonical: expense.cogs
+    profiles: [corporate]
+    synonyms:
+      - cost of sales
+      - cost of goods sold
+      - cost of revenue
+
+  - canonical: expense.interest
+    profiles: [corporate, financial]
+    synonyms:
+      - interest expense
+      - finance costs
+      - finance expense
+      - net finance costs
+      - borrowing costs
+
+  - canonical: expense.employee
+    profiles: [corporate, financial]
+    synonyms:
+      - employee expenses
+      - employee benefits expense
+      - personnel expenses
+      - salaries and wages
+      - staff costs
+
+  - canonical: expense.depreciation_amortisation
+    profiles: [corporate, financial]
+    synonyms:
+      - depreciation and amortisation
+      - depreciation expense
+      - amortisation expense
+      - depreciation and amortization
+
+  - canonical: expense.operating_other
+    profiles: [corporate, financial]
+    synonyms:
+      - other expenses
+      - other operating expenses
+      - administrative expenses
+      - general and administrative
+      - occupancy and equipment
+      - brokerage and other clearing, settlement and exchange fees
+
+  - canonical: expense.management_fees
+    profiles: [financial]
+    synonyms:
+      - management fees
+
+  - canonical: expense.impairment
+    profiles: [corporate, financial]
+    synonyms:
+      - impairment expense
+      - impairment losses
+      - impairment loss on financial assets
+
+  # ------------------- Totals & subtotals -------------------
+  - canonical: ebit
+    profiles: [corporate]
+    synonyms:
+      - operating profit
+      - earnings before interest and tax
+      - profit from operations
+      - operating income (loss)
+
+  - canonical: profit_before_tax
+    profiles: [corporate, financial]
+    synonyms:
+      - profit before tax
+      - loss before tax
+      - profit/(loss) before income tax
+      - profit/(loss) before income tax expense
+      - earnings before tax
+
+  - canonical: income_tax_expense
+    profiles: [corporate, financial]
+    synonyms:
+      - income tax expense
+      - income tax benefit
+      - tax expense
+      - tax (benefit)/expense
+
+  - canonical: net_profit
+    profiles: [corporate, financial]
+    synonyms:
+      - net profit
+      - net loss
+      - profit for the year
+      - profit/(loss) for the year
+      - net profit for the period
+      - profit attributable to owners
+
+  - canonical: other_comprehensive_income
+    profiles: [corporate, financial]
+    synonyms:
+      - other comprehensive income
+      - other comprehensive (loss)/income
+      - items that will not be reclassified to profit or loss
+
+  - canonical: total_comprehensive_income
+    profiles: [corporate, financial]
+    synonyms:
+      - total comprehensive income
+      - total comprehensive loss
+      - total comprehensive income/(loss)
+
+  # ------------------- Balance sheet items (needed for liquidity / leverage) -------------------
+  - canonical: balance.current_assets
+    profiles: [corporate]
+    synonyms:
+      - total current assets
+
+  - canonical: balance.current_liabilities
+    profiles: [corporate]
+    synonyms:
+      - total current liabilities
+
+  - canonical: balance.inventory
+    profiles: [corporate]
+    synonyms:
+      - inventories
+      - inventory
+
+  - canonical: balance.total_assets
+    profiles: [corporate, financial]
+    synonyms:
+      - total assets
+
+  - canonical: balance.total_liabilities
+    profiles: [corporate, financial]
+    synonyms:
+      - total liabilities
+
+  - canonical: balance.total_equity
+    profiles: [corporate, financial]
+    synonyms:
+      - total equity
+      - shareholders equity
+      - total shareholders equity
+
+  - canonical: balance.total_debt
+    profiles: [corporate, financial]
+    synonyms:
+      - borrowings
+      - total borrowings
+      - interest-bearing liabilities
+      - long-term debt
+      - short-term debt
