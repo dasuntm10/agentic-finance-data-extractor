@@ -14,10 +14,9 @@ Implementation of the architecture in [`ARCHITECTURE.md`](./ARCHITECTURE.md): an
 ```bash
 poetry install
 ollama pull qwen2.5:7b-instruct        # local LLM
-python scripts/fetch_models.py         # pulls BGE-small + Docling/TableFormer + PP-OCRv4 into ./models/
 ```
 
-After this one-time setup the pipeline runs entirely offline — no API keys, no network calls.
+BGE-small-en-v1.5, Docling/TableFormer, and PaddleOCR PP-OCRv4 weights are downloaded automatically on first use into `./models/`. After this one-time setup the pipeline runs entirely offline — no API keys, no network calls.
 
 Optional OCR fallback:
 
@@ -81,6 +80,7 @@ src/afde/
   agents/           # the 9 agents (ingest, locate, parse_statement, resolve_notes,
                     #               normalize, reconcile, ratios, score, report)
   llm/              # Local LLM client (Ollama / vLLM) + BGE-small embedder (cached)
+                    #   client.py, embeddings.py
   parsing/          # pdf_loader (PyMuPDF + Docling), ocr (PaddleOCR/Tesseract),
                     # numeric (accounting-aware Decimal + note-ref tokeniser)
   schemas.py        # Pydantic v2 contracts between agents
@@ -93,7 +93,12 @@ config/
   scoring.yaml            # piecewise-linear band thresholds + composite weights
 
 tests/unit/         # parser + scoring unit tests
-scripts/smoke_test.py     # stdlib-only sanity check vs real Citigroup PDF
+scripts/
+  smoke_test.py           # stdlib-only sanity check vs real Citigroup PDF
+  draw_architecture.py    # regenerate architecture.png (matplotlib)
+  draw_architecture_html.py  # regenerate architecture.html (standalone SVG)
+  draw_langgraph.py       # regenerate langgraph_flow.png via LangGraph built-in
+  md_to_docx.py           # convert ARCHITECTURE.md to ARCHITECTURE.docx
 ```
 
 ## Why Poetry
