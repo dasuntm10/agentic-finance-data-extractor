@@ -11,6 +11,7 @@ import logging
 import re
 from decimal import Decimal
 
+from afde.llm.client import ToolChoice, get_llm
 from afde.parsing.numeric import (
     detect_currency,
     detect_units,
@@ -74,18 +75,85 @@ def _pick_pl_table(doc: IngestedDocument, pages: list[int]) -> TableBlock | None
 
 
 def _find_period_end(doc: IngestedDocument, page: int) -> tuple[str, str]:
-    """Return (period_end_iso_like, period_label_like) by scanning nearby pages."""
-    # Search the P&L page and the page just before for "For the year ended X"
-    for p in (page, max(1, page - 1), page + 1):
+    """Return (period_end, period_label) for the financial year of the statement.
+
+    Three-tier resolution:
+      1. Regex — looks for "for the (year|period|half-year) ended <date>" on the
+         P&L page and the pages immediately before and after.
+      2. LLM  — if the regex finds nothing, passes the page text to Qwen2.5-7B
+         with a constrained JSON schema so the response is guaranteed to be a
+         date string or null. Used for unusual phrasings such as "Year ended
+         30 June 2024" or "12 months to 31 December 2024".
+      3. Fallback — returns "unknown" if the LLM is unavailable or returns null.
+         The caller already has the year label from the table column header, so
+         the pipeline continues correctly even without a full date string.
+    """
+    # --- Tier 1: regex ---
+    candidate_pages = (page, max(1, page - 1), page + 1)
+    page_texts: list[str] = []
+    for p in candidate_pages:
         pg = next((x for x in doc.pages if x.page == p), None)
         if not pg:
             continue
         m = _PERIOD_HEADER.search(pg.text)
         if m:
             raw = m.group(2).strip().rstrip(".")
+            log.debug("Period end found by regex: %s", raw)
             return raw, raw
-    # Fall back to year token in the header row of the chosen table
+        page_texts.append(pg.text[:2000])
+
+    # --- Tier 2: LLM ---
+    if page_texts:
+        result = _llm_find_period_end(page_texts)
+        if result:
+            log.debug("Period end found by LLM: %s", result)
+            return result, result
+
+    # --- Tier 3: fallback ---
+    log.warning("Could not determine period end for page %d; using 'unknown'.", page)
     return "unknown", "unknown"
+
+
+def _llm_find_period_end(page_texts: list[str]) -> str | None:
+    """Ask the local LLM to extract the financial year end date from page text."""
+    llm = get_llm()
+    tool = ToolChoice(
+        name="extract_period_end",
+        description=(
+            "Extract the financial year-end date of the statement. "
+            "Return the date exactly as it appears in the text (e.g. '31 December 2024', "
+            "'30 June 2024', '31 March 2023'). Return null if no date can be found."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "period_end": {
+                    "type": ["string", "null"],
+                    "description": "The financial year-end date as it appears in the document, or null.",
+                },
+            },
+            "required": ["period_end"],
+        },
+    )
+    excerpt = "\n\n---\n\n".join(page_texts)
+    try:
+        result = llm.structured(
+            tier="classification",
+            system=(
+                "You extract the financial year-end date from the text of a financial statement. "
+                "Look for phrases like 'year ended', 'period ended', '12 months to', "
+                "'financial year 20XX', or any date near the statement heading."
+            ),
+            user=f"Statement page text:\n\n{excerpt}",
+            tool=tool,
+            max_tokens=64,
+        )
+        value = result.get("period_end")
+        if value and str(value).strip().lower() not in ("null", "none", "unknown", ""):
+            return str(value).strip()
+    except Exception as e:
+        log.warning("LLM period-end extraction failed: %s", e)
+    return None
 
 
 def _note_col_index(header: list[str]) -> int | None:
@@ -93,6 +161,87 @@ def _note_col_index(header: list[str]) -> int | None:
         if c.strip().lower() in _NOTE_HEADERS:
             return i
     return None
+
+
+def _llm_parse_row_values(
+    row: list[str],
+    year_cols: list[tuple[int, str]],
+    label: str,
+) -> dict[str, Decimal]:
+    """Use the LLM to parse numeric values when standard parsing fails.
+
+    Invoked only when parse_number() returned None for every year column on a
+    row that has a valid label — e.g. OCR artifacts, unusual formatting, or
+    numbers written in a way the deterministic parser doesn't recognise.
+    The schema constrains the response to one string-or-null per year column,
+    so the model cannot hallucinate extra fields or refuse to answer.
+    """
+    llm = get_llm()
+
+    # Build per-year properties for the constrained schema
+    year_labels = [year for _, year in year_cols]
+    properties = {
+        year: {
+            "type": ["string", "null"],
+            "description": (
+                f"Numeric value for {year} as a plain number string "
+                f"(e.g. '108.8', '-580.8'). Use null if not present or not a number."
+            ),
+        }
+        for year in year_labels
+    }
+
+    tool = ToolChoice(
+        name="parse_row_values",
+        description=(
+            f"Extract the numeric monetary values for each year column from the row "
+            f"labelled {label!r}. Apply accounting conventions: "
+            "parentheses mean negative — (580.8) = -580.8. "
+            "A dash, em-dash, or empty cell means null."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": properties,
+            "required": year_labels,
+        },
+    )
+
+    cell_descriptions = "\n".join(
+        f"  {year}: {row[col_idx] if col_idx < len(row) else '(missing)'!r}"
+        for col_idx, year in year_cols
+    )
+    try:
+        result = llm.structured(
+            tier="classification",
+            system=(
+                "You parse numeric cell values from financial statement rows. "
+                "Accounting convention: (123.4) = -123.4. Dash or blank = null. "
+                "Return each value as a plain decimal string with no currency symbols or commas."
+            ),
+            user=f"Row label: {label!r}\nRaw cell contents:\n{cell_descriptions}",
+            tool=tool,
+            max_tokens=128,
+        )
+        values: dict[str, Decimal] = {}
+        for year in year_labels:
+            raw = result.get(year)
+            if raw is None or str(raw).strip().lower() in ("null", "none", ""):
+                continue
+            # Run through parse_number first so accounting conventions are applied
+            parsed = parse_number(str(raw))
+            if parsed is None:
+                # Last resort: direct Decimal conversion on cleaned string
+                try:
+                    parsed = Decimal(str(raw).replace(",", "").strip())
+                except Exception:
+                    continue
+            values[year] = parsed
+        if values:
+            log.info("LLM recovered values for row %r: %s", label, values)
+        return values
+    except Exception as e:
+        log.warning("LLM row-value parsing failed for %r: %s", label, e)
+        return {}
 
 
 def _build_line_item(
@@ -106,13 +255,15 @@ def _build_line_item(
     if not row or not row[label_idx].strip():
         return None
     label = row[label_idx].strip()
-    # Heuristics for header / blank rows
+    # Skip header / unit rows
     if label.lower().startswith(("$", "note")) or re.fullmatch(r"20\d{2}", label):
         return None
     notes: list[NoteRef] = []
     if note_idx is not None and note_idx < len(row):
         for ref in parse_note_refs(row[note_idx]):
             notes.append(NoteRef(note_number=int(ref["note_number"]), sub=ref["sub"], raw=ref["raw"]))
+
+    # --- Tier 1: deterministic numeric parser ---
     values: dict[str, Decimal] = {}
     for col_idx, year in year_cols:
         if col_idx >= len(row):
@@ -120,8 +271,15 @@ def _build_line_item(
         v = parse_number(row[col_idx])
         if v is not None:
             values[year] = v
+
+    # --- Tier 2: LLM fallback when all cells failed to parse ---
+    if not values:
+        values = _llm_parse_row_values(row, year_cols, label)
+
+    # If still no values the row is genuinely non-numeric (e.g. a section label)
     if not values:
         return None
+
     is_total = bool(
         re.search(r"^(total|net (loss|profit)|profit (before|after) tax|loss before)", label, re.I)
     )
