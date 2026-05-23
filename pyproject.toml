@@ -11,9 +11,9 @@ python = ">=3.10,<3.13"
 # Orchestration
 langgraph = ">=0.2.50"
 langgraph-checkpoint-sqlite = ">=2.0.1"
-# LLM + embeddings
-anthropic = ">=0.39.0"
-google-generativeai = ">=0.8.3"
+# LLM + embeddings (all local)
+sentence-transformers = ">=3.0.0"
+requests = ">=2.32.0"
 # PDF / parsing
 docling = ">=2.8.0"
 pypdf = ">=5.1.0"

@@ -6,16 +6,18 @@ Implementation of the architecture in [`ARCHITECTURE.md`](./ARCHITECTURE.md): an
 
 - **Python 3.10 - 3.12** (LangGraph and pydantic v2 with PEP 604 union types).
 - **[Poetry](https://python-poetry.org/docs/#installation)** as the package manager (`pipx install poetry` or `curl -sSL https://install.python-poetry.org | python3 -`).
-- `ANTHROPIC_API_KEY` (Claude - Haiku 4.5 for tiebreaks, Sonnet 4.6 for the narrative).
-- `GOOGLE_API_KEY` (Gemini `embedding-001` for label mapping).
+- **[Ollama](https://ollama.com/download)** running locally to serve `qwen2.5:7b-instruct` (the LLM used for classification tiebreaks and the analyst narrative). vLLM is supported as an alternative for GPU deployments.
 - *Optional:* PaddleOCR or Tesseract for the scanned-PDF branch (`B & E FOODS PTY LTD.pdf`).
 
 ## Setup
 
 ```bash
 poetry install
-cp .env.example .env   # fill in ANTHROPIC_API_KEY and GOOGLE_API_KEY
+ollama pull qwen2.5:7b-instruct        # local LLM
+python scripts/fetch_models.py         # pulls BGE-small + Docling/TableFormer + PP-OCRv4 into ./models/
 ```
+
+After this one-time setup the pipeline runs entirely offline — no API keys, no network calls.
 
 Optional OCR fallback:
 
@@ -43,7 +45,7 @@ Per-stage subcommands (useful when iterating on scoring thresholds without re-pa
 poetry run afde extract "data/CITIGROUP.pdf"   # parse + canonicalise → extraction.json
 ```
 
-## Smoke test (no install, no API keys)
+## Smoke test (no install required)
 
 A lightweight smoke test exercises the deterministic core (numeric parser, note-ref tokeniser, unit detection) against the real Citigroup PDF. It runs on Python 3.9+ and uses only stdlib + `pypdf`:
 
@@ -70,7 +72,7 @@ For each input `<name>.pdf` the pipeline writes to `outputs/<name>/`:
 
 ## Architecture
 
-See [`ARCHITECTURE.md`](./ARCHITECTURE.md). 9 specialised agents on a LangGraph `StateGraph` with a SQLite checkpointer; Docling + PaddleOCR for parsing; Claude (Haiku tiebreaks, Sonnet narrative, Opus only on escalation) for the three reasoning calls; Google `embedding-001` for canonical-label mapping.
+See [`ARCHITECTURE.md`](./ARCHITECTURE.md). 9 specialised agents on a LangGraph `StateGraph` with a SQLite checkpointer; Docling + PaddleOCR for parsing; a local Qwen2.5-7B-Instruct (via Ollama) for the three reasoning calls (locator tiebreak, mapper tiebreak, analyst narrative); BGE-small-en-v1.5 via `sentence-transformers` for canonical-label embedding. Fully offline at runtime.
 
 ## Layout
 
@@ -78,11 +80,11 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md). 9 specialised agents on a LangGraph 
 src/afde/
   agents/           # the 9 agents (ingest, locate, parse_statement, resolve_notes,
                     #               normalize, reconcile, ratios, score, report)
-  llm/              # Claude client (tiered) + Google embedding-001 wrapper (cached)
+  llm/              # Local LLM client (Ollama / vLLM) + BGE-small embedder (cached)
   parsing/          # pdf_loader (PyMuPDF + Docling), ocr (PaddleOCR/Tesseract),
                     # numeric (accounting-aware Decimal + note-ref tokeniser)
   schemas.py        # Pydantic v2 contracts between agents
-  config.py         # YAML + .env loading
+  config.py         # YAML config loading
   orchestrator.py   # LangGraph StateGraph wiring
   cli.py            # Typer entry points
 

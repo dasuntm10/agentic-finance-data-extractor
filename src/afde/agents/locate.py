@@ -3,7 +3,8 @@
 Finds the page ranges of the P&L / Consolidated Statement of Comprehensive Income,
 the notes block, and (optionally) the Statement of Financial Position. Uses a
 deterministic ToC parser first; falls back to a structural-signature scan; falls
-back to a Claude Haiku tiebreak only when multiple credible candidates exist.
+back to a local-LLM (Qwen2.5-7B-Instruct via Ollama) tiebreak only when multiple
+credible candidates exist.
 """
 from __future__ import annotations
 
@@ -133,7 +134,7 @@ def run(doc: IngestedDocument) -> SectionMap:
     cf_pages = sorted(set(toc["cf"] + headings["cf"]))
     notes_pages = sorted(set(toc["notes"] + headings["notes"]))
 
-    # If multiple credible P&L pages exist and ToC didn't disambiguate, ask Haiku
+    # If multiple credible P&L pages exist and ToC didn't disambiguate, ask the local LLM
     if len(pl_pages) > 1 and not toc["pl"]:
         pl_pages = [_llm_tiebreak(doc, pl_pages)]
 
@@ -193,14 +194,14 @@ def _llm_tiebreak(doc: IngestedDocument, candidates: list[int]) -> int:
     )
     try:
         result = llm.structured(
-            tier="haiku",
+            tier="classification",
             system="You disambiguate which page contains the primary financial statement.",
             user="\n\n".join(excerpts),
             tool=tool,
             max_tokens=256,
         )
         chosen = int(result.get("page") or candidates[0])
-        log.info("Locate tiebreak (haiku) chose p.%d: %s", chosen, result.get("reason"))
+        log.info("Locate tiebreak chose p.%d: %s", chosen, result.get("reason"))
         return chosen
     except Exception as e:
         log.warning("Locate tiebreak failed: %s — defaulting to first candidate %d", e, candidates[0])

@@ -7,9 +7,15 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from dotenv import load_dotenv
 
-load_dotenv()
+# Optional .env loading — only effective if python-dotenv is installed and a
+# .env file is present. Used for non-secret tunables like AFDE_LLM_BASE_URL.
+try:
+    from dotenv import load_dotenv  # noqa: PLC0415
+
+    load_dotenv()
+except ImportError:
+    pass
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = ROOT / "config"
@@ -32,13 +38,9 @@ def scoring_config() -> dict[str, Any]:
     return load_yaml("scoring.yaml")
 
 
-def is_offline() -> bool:
-    return os.environ.get("AFDE_OFFLINE", "0") not in ("0", "", "false", "False")
+def llm_base_url() -> str:
+    return os.environ.get("AFDE_LLM_BASE_URL", "http://localhost:11434")
 
 
-def anthropic_api_key() -> str | None:
-    return os.environ.get("ANTHROPIC_API_KEY")
-
-
-def google_api_key() -> str | None:
-    return os.environ.get("GOOGLE_API_KEY")
+def llm_model() -> str:
+    return os.environ.get("AFDE_LLM_MODEL", "qwen2.5:7b-instruct")

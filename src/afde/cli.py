@@ -21,9 +21,8 @@ from rich.table import Table
 from afde.config import (
     DATA_DIR,
     OUTPUT_DIR,
-    anthropic_api_key,
-    google_api_key,
-    is_offline,
+    llm_base_url,
+    llm_model,
 )
 from afde.orchestrator import run_pipeline
 from afde.schemas import RiskReport
@@ -105,10 +104,19 @@ def extract(pdf: Path = typer.Argument(..., exists=True, readable=True, dir_okay
 @app.command()
 def info() -> None:
     """Print environment / model / config diagnostics."""
+    import requests  # noqa: PLC0415
+
+    base = llm_base_url()
+    try:
+        r = requests.get(f"{base.rstrip('/')}/api/tags", timeout=2)
+        llm_status = f"reachable ({r.status_code})" if r.status_code == 200 else f"[red]error {r.status_code}[/]"
+    except Exception as e:
+        llm_status = f"[red]unreachable: {e}[/]"
+
     t = Table(show_header=False)
-    t.add_row("ANTHROPIC_API_KEY", "set" if anthropic_api_key() else "[red]missing[/]")
-    t.add_row("GOOGLE_API_KEY", "set" if google_api_key() else "[red]missing[/]")
-    t.add_row("AFDE_OFFLINE", "yes" if is_offline() else "no")
+    t.add_row("LLM backend", base)
+    t.add_row("LLM model", llm_model())
+    t.add_row("LLM status", llm_status)
     t.add_row("Data dir", str(DATA_DIR))
     t.add_row("Output dir", str(OUTPUT_DIR))
     console.print(t)

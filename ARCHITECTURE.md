@@ -3,9 +3,7 @@
 **Project:** CreditSource - Agentic data extraction & credit scoring from Australian annual reports
 **Author:** Dasun
 **Document scope:** Optimal end-to-end design for Tasks 1, 2 (optional impl), and 3 (optional risk model) of the CreditSource case study.
-**Constraints honoured:** Python; reproducible via **Poetry** (`pyproject.toml` + `poetry.lock`); LLM reasoning via the **Anthropic Claude API** (tiered: Haiku 4.5 for classification tiebreaks, Sonnet 4.6 for the analyst narrative) and embeddings via **Google `embedding-001`** (Gemini API). All other tooling (PDF parsing, OCR, orchestration, validation, scoring math) remains open-source and local.
-
-> **Note on the case-study constraint.** The brief states no third-party hosted services. The current design uses Claude + Google embeddings per explicit project direction - this is a deliberate trade against the brief in favour of accuracy and time-to-deliver. The agent boundaries are designed so that the two hosted dependencies can be swapped for offline equivalents (Qwen2.5-7B + BGE-small) by replacing two files (`src/llm/client.py`, `src/llm/embeddings.py`) without touching agent logic. This fallback path is described in §11.
+**Constraints honoured:** Python; reproducible via **Poetry** (`pyproject.toml` + `poetry.lock`); **fully offline** — no third-party hosted services at runtime. LLM reasoning runs on a **local Qwen2.5-7B-Instruct** served by Ollama (or vLLM), and embeddings come from **BGE-small-en-v1.5** loaded via `sentence-transformers`. All other tooling (PDF parsing, OCR, orchestration, validation, scoring math) is also open-source and local.
 
 ---
 
@@ -43,7 +41,7 @@ This drives several non-negotiable requirements:
 5. **Negative values are parenthesised.** `(580.8)` means `-580.8`. Numeric parsing must be aware of accounting conventions.
 6. **Year columns vary in count and label.** Two-year comparatives are typical; some statements show a third "Note" column or a `Restated` column.
 
-The brief explicitly calls out an agentic workflow (LangGraph / LlamaIndex Workflows or similar). A pure-prompt LLM extractor is **not** the right answer for this corpus - the documents are layout-heavy, the reasoning is verifiable (numbers must reconcile), and the budget is offline open-source models. The optimal design splits responsibilities so that each agent's job is small enough to be solved with **specialised tooling + a tightly scoped LLM call**, with deterministic validators between agents.
+The brief explicitly calls out an agentic workflow (LangGraph / LlamaIndex Workflows or similar) and a strict offline constraint. A pure-prompt LLM extractor is **not** the right answer for this corpus - the documents are layout-heavy, the reasoning is verifiable (numbers must reconcile), and the entire stack must run locally. The optimal design splits responsibilities so that each agent's job is small enough to be solved with **specialised tooling + a tightly scoped local-LLM call**, with deterministic validators between agents.
 
 ---
 
@@ -54,7 +52,7 @@ The brief explicitly calls out an agentic workflow (LangGraph / LlamaIndex Workf
 3. **Layout-aware ingestion.** Page-level layout (columns, tables, headings) is preserved through to extraction. We do not flatten the PDF to a single text stream.
 4. **Verifiable extraction.** Every extracted value carries provenance: `{page, bbox, source_table_id}` so a human (or a self-check agent) can re-open the page and audit it.
 5. **Reconciliation as a first-class check.** Subtotals and totals must equal the sum of their children within a tolerance. A failed reconciliation triggers a **re-extract** loop rather than silently propagating bad numbers downstream.
-6. **Local, reproducible.** All models cached under `./models/`. `poetry install && poetry run afde run …` reproduces a run with no network.
+6. **Local, reproducible, offline.** All weights — Docling layout/TableFormer, PaddleOCR PP-OCRv4, Qwen2.5-7B-Instruct, BGE-small-en-v1.5 — are pre-fetched under `./models/`. After a one-time setup, `poetry run afde run …` executes with no network access at all.
 
 ---
 
@@ -112,11 +110,11 @@ Each agent is defined by **(role, inputs, tools, outputs, failure mode)**. All o
 ### Agent 2 - Section Locator Agent
 
 - **Role:** Find the page range of the Statement of Profit or Loss / Consolidated Statement of Comprehensive Income, and the page range of the Notes block.
-- **Tools:** Table-of-contents heuristics + **Claude Haiku 4.5 (`claude-haiku-4-5-20251001`)** via the Anthropic API for ambiguity resolution.
+- **Tools:** Table-of-contents heuristics + the **local Qwen2.5-7B-Instruct** LLM for ambiguity resolution.
 - **Logic:**
   1. First, parse the ToC if present (Citigroup p.5 has one). Map `Consolidated statement of comprehensive income → 5` etc.
   2. If no ToC, scan headings for a regex set: `(consolidated\s+)?statement of (profit (and|or) loss|comprehensive income)`, `profit (and|or) loss`, `income statement`. Also detect by **structural signature**: a page containing a table with a `Note` column header and at least one numeric `$Million|$'000|$000` row.
-  3. Haiku is only invoked when ≥2 candidate sections exist and a deterministic tie-break is impossible - e.g. when both "Statement of Profit or Loss" and "Statement of Comprehensive Income" are present as separate pages (some entities split them). The call uses Claude's native tool-use mode (`tool_choice` forcing a schema-defining tool whose `enum` lists the candidate page-range IDs) so the response is guaranteed valid. Haiku is the right tier here - the task is constrained classification, not open reasoning.
+  3. The local LLM is only invoked when ≥2 candidate sections exist and a deterministic tie-break is impossible - e.g. when both "Statement of Profit or Loss" and "Statement of Comprehensive Income" are present as separate pages (some entities split them). The call uses **JSON-schema-constrained decoding** (Ollama `format: "json"` with a schema whose `enum` lists the candidate page-range IDs, or `outlines` / `lm-format-enforcer` under vLLM) so the response is guaranteed structurally valid. A 7B instruct model is more than enough for constrained classification with a tiny answer space; a larger model adds no headroom on enum selection.
 - **Output:** `SectionMap { pl_pages: [int], notes_pages: [int], pl_title: str }`.
 
 ### Agent 3 - Statement Parser Agent
@@ -131,7 +129,7 @@ Each agent is defined by **(role, inputs, tools, outputs, failure mode)**. All o
      - `note_refs` parsing handles `3(a)`, `3, 26`, `3(d), 26`, plain `4`, and the empty cell.
      - Negative amounts in `( )` are converted to `Decimal('-…')`.
      - Subtotal / total rows are flagged via heuristic (bold, indentation, label contains `Total|Net (loss|profit)|Profit before tax`).
-  5. Claude is NOT used to read numbers. It is only consulted to **label-classify** rows (e.g. is "Brokerage and other clearing, settlement and exchange fees" an opex item?) - and only when the canonical mapper (Agent 5) cannot match it deterministically.
+  5. The LLM is NOT used to read numbers. It is only consulted to **label-classify** rows (e.g. is "Brokerage and other clearing, settlement and exchange fees" an opex item?) - and only when the canonical mapper (Agent 5) cannot match it deterministically.
 - **Output:** `Statement { kind, title, currency, units, period_end, period_label, line_items: List[LineItem], provenance }`.
 
 ### Agent 4 - Note Resolver Agent
@@ -147,7 +145,7 @@ Each agent is defined by **(role, inputs, tools, outputs, failure mode)**. All o
 ### Agent 5 - Canonical Mapper / Normaliser Agent
 
 - **Role:** Map the company-specific labels to a canonical chart of accounts so downstream ratios work uniformly across all four companies despite their different statement layouts.
-- **Tools:** Rules + embedding similarity (**Google `embedding-001`** via the Gemini API, 768-dim) + **Claude Haiku 4.5** only as last resort.
+- **Tools:** Rules + embedding similarity (**BGE-small-en-v1.5** via `sentence-transformers`, 384-dim, fully local) + the **local Qwen2.5-7B-Instruct** LLM only as last resort.
 - **Canonical schema (extract):**
   ```
   revenue.total
@@ -166,9 +164,9 @@ Each agent is defined by **(role, inputs, tools, outputs, failure mode)**. All o
   total_comprehensive_income
   ```
   Plus the balance sheet items needed for liquidity & leverage (current assets, current liabilities, total assets, total equity, total debt) which Agent 3 also extracts from the Statement of Financial Position when present - the brief allows this since notes attached to the P&L commonly cross-reference balance-sheet items.
-- **Logic:** rules-based label match first; embedding similarity (`embedding-001`, cosine) for unmatched; a Haiku tiebreak call when similarity < 0.7 OR there are competing canonical candidates above 0.7. The call is forced through a `tool_use` schema whose `enum` is the canonical chart of accounts - making invalid outputs structurally impossible. Haiku is the right tier because the answer space is finite and the input is short (a label string plus its top-5 candidates with similarities); upgrading to Sonnet/Opus does not change the achievable accuracy on enum classification with strong embedding priors.
+- **Logic:** rules-based label match first; embedding similarity (BGE-small, cosine) for unmatched; a local-LLM tiebreak call when similarity < 0.7 OR there are competing canonical candidates above 0.7. The call uses JSON-schema-constrained decoding whose `enum` is the canonical chart of accounts - making invalid outputs structurally impossible. A 7B instruct model is the right size because the answer space is finite and the input is short (a label string plus its top-5 candidates with similarities); a larger model does not change the achievable accuracy on enum classification with strong embedding priors.
 
-  Embedding-001 outputs are cached in `outputs/<company>/_cache/embeddings.jsonl` keyed by the SHA-256 of the input string, so a re-run never repays for already-seen labels - important for cost control with a hosted embedding API.
+  Embedding outputs are cached in `outputs/<company>/_cache/embeddings.jsonl` keyed by the SHA-256 of the input string. Although BGE-small inference is essentially free (a few ms per label on CPU), the cache still makes re-runs deterministic and lets re-scoring skip the embedder entirely.
 - **Output:** `CanonicalStatement` keyed on canonical labels, with original labels retained for audit.
 
 ### Agent 6 - Reconciliation / Self-Check Agent
@@ -200,11 +198,11 @@ Each agent is defined by **(role, inputs, tools, outputs, failure mode)**. All o
 ### Agent 9 - Risk Report Writer
 
 - **Role:** Emit the per-company structured artefact and a short analyst-facing narrative.
-- **Tools:** **Claude Sonnet 4.6 (`claude-sonnet-4-6`)** for the narrative; WeasyPrint for the PDF. Sonnet is the right tier here - this is the one place where model size affects what a credit analyst actually reads. Opus is available as a config override for engagements where narrative quality is being benchmarked, but in routine use Sonnet's prose is indistinguishable to a credit analyst and ~5× cheaper.
+- **Tools:** the **local Qwen2.5-7B-Instruct** for the narrative; WeasyPrint for the PDF. A larger local model (Qwen2.5-14B-Instruct or Qwen2.5-32B-Instruct) is wired as an optional `narrative_model` override in `config/scoring.yaml` for engagements with a GPU budget; in routine use the 7B prose is fluent enough for an analyst-facing risk summary and runs comfortably on CPU.
 - **Outputs:**
   - `outputs/<company>/extraction.json` - full structured extraction (statement + notes + canonical + ratios + score).
   - `outputs/<company>/risk_report.md` (and PDF via `weasyprint`) - narrative containing: headline score, key ratios with YoY delta, material risks/anomalies the validator flagged, data-quality notes.
-- The narrative is the **only** place Claude writes free-form text. It is constrained to facts from the structured object - prompted with the JSON and instructed not to introduce numbers not present in the input. A post-write check greps the narrative for numerics and verifies each appears in the source object; any unsourced figure triggers a regeneration with the offending span quoted back to the model. On a second failure the run escalates the same prompt to Opus 4.7 - this is the only place in the pipeline where Opus is reached, and only on the unhappy path.
+- The narrative is the **only** place the LLM writes free-form text. It is constrained to facts from the structured object - prompted with the JSON and instructed not to introduce numbers not present in the input. A post-write check greps the narrative for numerics and verifies each appears in the source object; any unsourced figure triggers a regeneration with the offending span quoted back to the model. On a second failure the run falls back to a **deterministic template-rendered narrative** built directly from the structured JSON - no free-form text, no risk of hallucination. The structured artefact is always emitted regardless.
 
 ---
 
@@ -273,9 +271,9 @@ With N=4, hold-out validation is impossible. The validation we **can** do, and w
 | Document parsing | **Docling** (IBM, Apache-2.0) with TableFormer | Best open-source layout + table model for financial PDFs. Outputs structured `DoclingDocument`, not flat text. |
 | OCR (fallback) | **PaddleOCR** (PP-OCRv4) | Stronger on dense tables than Tesseract; fully offline. |
 | Layout cross-check | **PyMuPDF (fitz)** | Vector text + bbox, used to verify Docling table boundaries. |
-| LLM (hosted, tiered) | **Anthropic Claude** via the official `anthropic` SDK. **Haiku 4.5** (`claude-haiku-4-5-20251001`) for (a) section-locator tie-breaks and (b) canonical-mapper tiebreaks - both are constrained classification with `tool_use` enums where a bigger model adds no headroom. **Sonnet 4.6** (`claude-sonnet-4-6`) for (c) the analyst narrative - the one call where model size affects analyst-facing quality. **Opus 4.7** (`claude-opus-4-7`) is reserved as an escalation on a second hallucination-check failure, not a default. | Tiering keeps per-document cost roughly an order of magnitude below an all-Opus pipeline while preserving quality on the only call that warrants it. ≤3 model calls per document on the happy path. |
-| Structured outputs | Claude **`tool_use`** with strict JSON schemas (Pydantic-derived) | Native to the Anthropic API - no need for `outlines`/`lm-format-enforcer`. Invalid outputs are structurally impossible because the model is forced through a tool call. |
-| Embeddings (hosted) | **Google `embedding-001`** via the `google-generativeai` SDK (768-dim, `task_type=SEMANTIC_SIMILARITY`) | Used for label-to-canonical mapping and note keyword search. Calls are content-hash cached on disk so re-runs are free. |
+| LLM (local) | **Qwen2.5-7B-Instruct** served by **Ollama** (default; one-line install on macOS/Linux/Windows) or **vLLM** (when a GPU is available for higher throughput). Used for (a) section-locator tie-breaks, (b) canonical-mapper tiebreaks, (c) the analyst narrative. | Strong instruction-following at 7B; Apache-2.0 weights; runs on CPU at acceptable latency for a batch-style pipeline. Fully offline at runtime - no API keys, no egress. |
+| Structured outputs | **JSON-schema-constrained decoding** - Ollama's `format` parameter under the hood, or `outlines` / `lm-format-enforcer` when running on vLLM. Schemas are derived from the same Pydantic models the agents pass around. | Invalid outputs are structurally impossible because the decoder is forced to emit a JSON value that satisfies the schema. Equivalent guarantee to a hosted "forced tool call", entirely on-device. |
+| Embeddings (local) | **BGE-small-en-v1.5** via `sentence-transformers` (384-dim, ~33M params, MIT) | Used for label-to-canonical mapping and note keyword search. Vectors are content-hash cached on disk so re-runs are deterministic; CPU inference is a few ms per label. |
 | Vector index (fallback) | **FAISS** (local) | Only for the small per-document note index - Postgres+pgvector is overkill. |
 | Validation | **Pydantic v2** | Inter-agent contracts. |
 | Numerics | **`decimal.Decimal`** end-to-end; **Pandas** only at the reporting layer | Float arithmetic on currency is a footgun. |
@@ -284,11 +282,11 @@ With N=4, hold-out validation is impossible. The validation we **can** do, and w
 | Testing | **pytest** with golden JSON snapshots per document | Regression-protects extraction; one snapshot per company. |
 | CLI | **Typer** | `extract run`, `extract score`, `extract report` subcommands. |
 
-### API keys & local model cache
+### Local model cache
 
-- `ANTHROPIC_API_KEY` and `GOOGLE_API_KEY` are read from a `.env` file (loaded via `python-dotenv`) and never logged. The README documents both. CI uses repo secrets.
-- Open-source weights that *do* run locally - Docling layout/TableFormer, PaddleOCR PP-OCRv4 - are still pre-fetched by `scripts/fetch_models.py` into `./models/`, so the local parsing path never reaches the network at runtime. Only Claude and embedding-001 calls hit external services.
-- A `--offline` CLI flag flips the LLM client and embedder to their open-weight fallbacks (Qwen2.5-7B + BGE-small) for the case-study submission profile and for air-gapped environments. See §11.
+- **No API keys.** The runtime makes no network calls.
+- All weights - Docling layout/TableFormer, PaddleOCR PP-OCRv4, Qwen2.5-7B-Instruct, BGE-small-en-v1.5 - are pre-fetched by `scripts/fetch_models.py` into `./models/`. Ollama caches the Qwen GGUF under `~/.ollama/models/` on first pull; `fetch_models.py` issues the `ollama pull qwen2.5:7b-instruct` command as part of one-time setup.
+- After setup, the entire pipeline runs air-gapped. `poetry install` + `python scripts/fetch_models.py` are the only steps that touch the network, and both happen once on a connected machine.
 
 ---
 
@@ -326,8 +324,8 @@ agentic-finance-data-extractor/
 │   │   ├── score.py
 │   │   └── report.py
 │   ├── llm/
-│   │   ├── client.py            # Anthropic Claude wrapper (swappable for Qwen via --offline)
-│   │   ├── embeddings.py        # google-generativeai embedding-001 wrapper (cached)
+│   │   ├── client.py            # Local LLM wrapper (Ollama / vLLM) with JSON-schema decoding
+│   │   ├── embeddings.py        # sentence-transformers BGE-small wrapper (cached)
 │   │   └── prompts/             # versioned prompts
 │   ├── parsing/
 │   │   ├── docling_loader.py
@@ -377,10 +375,9 @@ Concrete predictions of what each agent will do on the four files - this is the 
 3. **Unit/currency drift between tables** - units are bound to the statement/sub-table, not the document, and the canonical layer scales values to a single base unit ($AUD, 1.0) before ratios are computed.
 4. **Banks vs corporates** - two ratio templates and two scoring profile YAMLs. Section Locator's classifier selects.
 5. **OCR digit confusion** - the reconciliation agent catches it because rows must sum. A mis-OCR'd `108.8` → `100.0` will break the subtotal and trigger a retry.
-6. **LLM hallucination in the narrative report** - mitigated by (a) Claude `tool_use` structured outputs everywhere except the final narrative, (b) a post-write check that verifies every numeric in the narrative appears verbatim in the source JSON; unsourced figures trigger a regeneration.
+6. **LLM hallucination in the narrative report** - mitigated by (a) JSON-schema-constrained decoding everywhere except the final narrative, (b) a post-write check that verifies every numeric in the narrative appears verbatim in the source JSON; unsourced figures trigger a regeneration, and a second failure falls back to a deterministic template-rendered narrative.
 7. **N=4 is too small for ML scoring** - addressed by going hybrid rules + statistical (§5) and being explicit about it.
-8. **Hosted-API cost & latency** - bounded by design *and* by model tiering: ≤3 Claude calls per document - two on Haiku 4.5 (locator tiebreak, mapper tiebreak) and one on Sonnet 4.6 (narrative). Opus 4.7 is reached only as an escalation on the unhappy path. Embedding calls are content-hash cached on disk so each unique label is embedded at most once across all runs. Per-document cost is dominated by the Sonnet narrative call (~3-6k input tokens, ~1k output) - well within a sub-dollar budget per document on the happy path, and roughly an order of magnitude cheaper than running every call on Opus.
-9. **Network dependency conflicts with the brief's offline rule** - the `--offline` profile (Qwen2.5-7B-Instruct via vLLM/Ollama + BGE-small via sentence-transformers) is wired through the same `LLMClient` / `Embedder` interfaces, so the submission can be run either way without changing agent code.
+8. **Local LLM latency** - bounded by design: ≤3 LLM calls per document (locator tiebreak, mapper tiebreak, narrative). The narrative is the dominant cost - ~3-6k input tokens, ~1k output, ~10-25s on CPU for Qwen2.5-7B, single-digit seconds on a consumer GPU. Embedding inference is a few ms per label and content-hash cached so each unique label is embedded at most once across all runs.
 
 ---
 
@@ -403,11 +400,11 @@ Concrete predictions of what each agent will do on the four files - this is the 
 
 These are points where I have made a defensible default but the interviewer may want a different choice:
 
-1. **Hosted vs offline profile** - the default profile uses Claude (`claude-opus-4-7`) + Google `embedding-001`, which trades the brief's offline constraint for accuracy and time-to-deliver. The `--offline` profile (Qwen2.5-7B-Instruct + BGE-small-en-v1.5) is wired through the same interfaces and is the profile that strictly satisfies the brief. The interviewer can choose which to demo.
+1. **Local LLM choice.** Defaulting to Qwen2.5-7B-Instruct because it is the strongest Apache-2.0 7B instruct model at the time of build, runs on CPU, and supports JSON-schema-constrained decoding. Llama-3.1-8B-Instruct is wired as a swap (single config line) for shops with an existing Llama-family deployment. A 14B/32B Qwen is supported as a `narrative_model` override when a GPU is available.
 2. **Whether to extract the Statement of Financial Position.** Defaulting to yes, because the brief explicitly requires liquidity & leverage ratios which cannot be computed from the P&L alone. If the brief intends "P&L only", liquidity/leverage become `null` for all companies.
 3. **Scoring weights** - defaulting to the values in §5.2; configurable via YAML so the credit team can override.
 4. **Risk-report format** - defaulting to Markdown + PDF. Switch to HTML or DOCX is one templating change.
-5. **Data egress** - sending excerpts of audited financials to Anthropic/Google needs to be cleared with whoever owns data-handling policy at CreditSource before this profile is used on customer documents. The offline profile sidesteps this entirely.
+5. **GPU vs CPU deployment.** Defaulting to CPU for the case-study submission (works on any machine). For production throughput, dropping in vLLM on a single consumer GPU brings the narrative call from ~10-25s to ~2-4s and lets the same agent code parallelise across documents.
 
 ---
 

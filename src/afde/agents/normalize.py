@@ -1,7 +1,8 @@
 """Agent 5 — Canonical Mapper / Normaliser.
 
-Rules → embedding similarity → Claude Haiku tiebreak. Output is a CanonicalStatement
-keyed on the canonical chart of accounts (config/canonical_labels.yaml).
+Rules → embedding similarity (BGE-small) → local-LLM (Qwen2.5-7B) tiebreak.
+Output is a CanonicalStatement keyed on the canonical chart of accounts
+(config/canonical_labels.yaml).
 """
 from __future__ import annotations
 
@@ -99,7 +100,7 @@ def _llm_tiebreak(label: str, top_k: list[tuple[str, float]], profile: CompanyPr
     )
     try:
         result = llm.structured(
-            tier="haiku",
+            tier="classification",
             system="You map noisy financial-statement labels to a fixed canonical chart of accounts.",
             user=user,
             tool=tool,

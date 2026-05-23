@@ -1,7 +1,9 @@
-"""Google embedding-001 wrapper with on-disk content-hash cache.
+"""Local sentence-transformers embedder (BGE-small-en-v1.5) with on-disk cache.
 
-Cache layout: one JSONL file per company under outputs/<company>/_cache/embeddings.jsonl
-where each line is {"sha": <sha256>, "text": <input>, "vector": [...]}.
+Cache layout: one JSONL file per company under ``outputs/<company>/_cache/embeddings.jsonl``
+where each line is ``{"sha": <sha256>, "text": <input>, "vector": [...]}``. The
+cache makes re-runs deterministic and lets the canonical mapper skip embedding
+work entirely on the second pass.
 """
 from __future__ import annotations
 
@@ -9,17 +11,13 @@ import hashlib
 import json
 import logging
 import math
+import os
 from pathlib import Path
-
-from tenacity import retry, stop_after_attempt, wait_exponential
-
-from afde.config import google_api_key
 
 log = logging.getLogger(__name__)
 
-EMBED_MODEL = "models/embedding-001"
-EMBED_DIM = 768
-TASK_TYPE = "SEMANTIC_SIMILARITY"
+EMBED_MODEL = os.environ.get("AFDE_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+EMBED_DIM = 384
 
 
 class EmbedderUnavailable(RuntimeError):
@@ -31,12 +29,14 @@ def _sha(text: str) -> str:
 
 
 class Embedder:
-    def __init__(self, cache_dir: Path | str | None = None, api_key: str | None = None) -> None:
-        self.api_key = api_key or google_api_key()
+    """sentence-transformers wrapper with a content-hash JSONL cache."""
+
+    def __init__(self, cache_dir: Path | str | None = None, model_name: str | None = None) -> None:
         self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.model_name = model_name or EMBED_MODEL
         self._cache: dict[str, list[float]] = {}
         self._cache_loaded = False
-        self._client = None
+        self._model = None
 
     def _ensure_loaded(self) -> None:
         if self._cache_loaded or self.cache_dir is None:
@@ -60,23 +60,21 @@ class Embedder:
         with cache_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps({"sha": sha, "text": text[:200], "vector": vector}) + "\n")
 
-    def _get_client(self):
-        if self._client is None:
-            if not self.api_key:
-                raise EmbedderUnavailable("GOOGLE_API_KEY not set.")
+    def _get_model(self):
+        if self._model is None:
             try:
-                import google.generativeai as genai
+                from sentence_transformers import SentenceTransformer  # noqa: PLC0415
             except ImportError as e:
-                raise EmbedderUnavailable("google-generativeai not installed; `poetry install`.") from e
-            genai.configure(api_key=self.api_key)
-            self._client = genai
-        return self._client
+                raise EmbedderUnavailable(
+                    "sentence-transformers not installed; `poetry install`."
+                ) from e
+            self._model = SentenceTransformer(self.model_name)
+        return self._model
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=20))
     def _embed_one(self, text: str) -> list[float]:
-        genai = self._get_client()
-        resp = genai.embed_content(model=EMBED_MODEL, content=text, task_type=TASK_TYPE)
-        return list(resp["embedding"])
+        model = self._get_model()
+        vec = model.encode([text], normalize_embeddings=True)[0]
+        return [float(x) for x in vec]
 
     def embed(self, text: str) -> list[float]:
         self._ensure_loaded()
@@ -102,18 +100,14 @@ def cosine(a: list[float], b: list[float]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Offline fallback — deterministic hashing "embedding" so the canonical mapper
-# can still find an exact-match synonym without network access.
+# Deterministic fallback — used only when sentence-transformers is unavailable
+# (e.g. the smoke test environment). Hashes the lowercased input into a
+# pseudo-random unit vector. Not semantically useful; the canonical mapper's
+# rule-based path still works because exact synonyms hit the rule layer first.
 # ---------------------------------------------------------------------------
 
 
-class OfflineEmbedder:
-    """Cheap fallback: hashes the lowercased input into a deterministic unit vector.
-
-    Not semantically useful — synonyms will not match. Real --offline profile
-    swaps this for BGE-small via sentence-transformers.
-    """
-
+class FallbackEmbedder:
     def embed(self, text: str) -> list[float]:
         h = hashlib.sha256(text.strip().lower().encode("utf-8")).digest()
         vec = [b / 255.0 - 0.5 for b in h] * (EMBED_DIM // 32 + 1)
@@ -125,9 +119,11 @@ class OfflineEmbedder:
         return [self.embed(t) for t in texts]
 
 
-def get_embedder(cache_dir: Path | str | None = None) -> Embedder | OfflineEmbedder:
-    from afde.config import is_offline
+def get_embedder(cache_dir: Path | str | None = None) -> Embedder | FallbackEmbedder:
+    try:
+        import sentence_transformers  # noqa: F401, PLC0415
 
-    if is_offline() or not google_api_key():
-        return OfflineEmbedder()
-    return Embedder(cache_dir=cache_dir)
+        return Embedder(cache_dir=cache_dir)
+    except ImportError:
+        log.warning("sentence-transformers not installed; using FallbackEmbedder (rule-match only).")
+        return FallbackEmbedder()

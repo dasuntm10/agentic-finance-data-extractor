@@ -1,6 +1,6 @@
 """Lightweight smoke test for the deterministic parsing path.
 
-Designed to run with stdlib + pypdf only (no LangGraph, no pydantic v2, no Claude).
+Designed to run with stdlib + pypdf only (no LangGraph, no pydantic v2, no LLM).
 Validates:
   - numeric parser handles ( ) negatives, commas, dashes, footnote markers
   - note-ref tokeniser handles 3(a), 3, 26, 3(d), 26, plain integers
