@@ -161,18 +161,106 @@ def _structural_pl_candidates(doc: IngestedDocument) -> list[int]:
     return out
 
 
-def _expand_to_continuation_pages(doc: IngestedDocument, start_page: int) -> list[int]:
+def _scan_page_text_titles(doc: IngestedDocument) -> dict[str, list[int]]:
+    """Fallback page detection: scan page *text* for statement titles.
+
+    Locate's primary path matches font-sized headings, but some reports (notably
+    bank statements) render statement titles in body-sized font, so they never
+    become headings and `_scan_headings` returns nothing. Here we match a title
+    pattern *anchored at the start* of a short line: that catches the real title
+    ('Consolidated statement of comprehensive income') while rejecting prose
+    mentions ('Financial assets at fair value through profit or loss').
+    """
+    out: dict[str, list[int]] = {"pl": [], "bs": [], "cf": [], "notes": []}
+    section_patterns = [
+        ("pl", PL_TITLE_PATTERNS),
+        ("bs", BS_TITLE_PATTERNS),
+        ("cf", CF_TITLE_PATTERNS),
+        ("notes", NOTES_TITLE_PATTERNS),
+    ]
+    for page in doc.pages:
+        for raw_line in (page.text or "").splitlines():
+            line = raw_line.strip()
+            if not line or len(line) > 70:
+                continue
+            for key, patterns in section_patterns:
+                if any(p.match(line) for p in patterns):
+                    if page.page not in out[key]:
+                        out[key].append(page.page)
+                    break
+    return out
+
+
+def _notes_run_start(notes_pages: list[int]) -> int | None:
+    """First page of the first *consecutive run* of notes pages.
+
+    Notes pages are detected by their running header, which can also match a stray
+    page (e.g. a contents/reference page) far from the real notes block. Requiring a
+    run of three consecutive pages ignores those strays and finds where notes truly begin.
+    """
+    s = sorted(set(notes_pages))
+    for p in s:
+        if (p + 1) in s and (p + 2) in s:
+            return p
+    return s[0] if s else None
+
+
+def candidate_statement_pages(doc: IngestedDocument, margin: int = 1) -> set[int]:
+    """Cheap (no-LLM, no-table) guess at which physical pages hold the primary
+    statements, used to target Docling extraction at just those pages instead of the
+    whole document.
+
+    Uses heading text + a page-text title scan, keeps only candidates *before* the
+    notes block (primary statements always precede the notes), and pads each by
+    ``margin`` pages. Returns an empty set when nothing matches — the caller should
+    then fall back to extracting the whole document.
+    """
+    toc_titles = _scan_toc_titles(doc)
+    headings = _scan_headings(doc, toc_titles=toc_titles)
+    text = _scan_page_text_titles(doc)
+
+    notes_start = _notes_run_start((headings["notes"] or []) + (text["notes"] or []))
+
+    def before_notes(p: int) -> bool:
+        return notes_start is None or p < notes_start
+
+    pl = {p for p in set(headings["pl"]) | set(text["pl"]) if before_notes(p)}
+    bs = {p for p in set(headings["bs"]) | set(text["bs"]) if before_notes(p)}
+    seeds = pl | bs
+    if not seeds:
+        return set()
+
+    out: set[int] = set()
+    for p in seeds:
+        for q in range(p - margin, p + margin + 1):
+            if 1 <= q <= doc.page_count:
+                out.add(q)
+    return out
+
+
+def _expand_to_continuation_pages(
+    doc: IngestedDocument,
+    start_page: int,
+    boundary_pages: frozenset[int] = frozenset(),
+    max_pages: int = 3,
+) -> list[int]:
     """Walk forward from start_page, adding pages that continue the same table.
 
     A page is a continuation if it has no heading that starts a new named section
     and contains at least one numeric value (i.e. still has table row data).
-    Stops as soon as a new section heading appears or a page has no numeric content.
+    Stops as soon as a new section starts or a page has no numeric content.
+
+    ``boundary_pages`` are known starts of *other* sections (balance sheet, cash
+    flow, notes) detected by text-scan — essential when the PDF has no font-sized
+    headings, otherwise expansion runs all the way to the end of the document.
+    ``max_pages`` caps the span as a final safety net (primary statements that
+    wrap do so over very few pages).
     """
     pages = [start_page]
     section_starters = BS_TITLE_PATTERNS + CF_TITLE_PATTERNS + NOTES_TITLE_PATTERNS + PL_TITLE_PATTERNS
 
-    # Build a set of pages that open a new named section
-    new_section_pages: set[int] = set()
+    # Pages that open a new named section: from headings AND the text-scan boundaries.
+    new_section_pages: set[int] = {p for p in boundary_pages if p > start_page}
     for h in doc.headings:
         if h.page > start_page:
             if any(p.search(h.text) for p in section_starters):
@@ -181,6 +269,8 @@ def _expand_to_continuation_pages(doc: IngestedDocument, start_page: int) -> lis
     for page in doc.pages:
         if page.page <= start_page:
             continue
+        if len(pages) >= max_pages:
+            break
         if page.page in new_section_pages:
             break
         if not re.search(r"\d[\d,\.]+", page.text or ""):
@@ -214,11 +304,15 @@ def run(doc: IngestedDocument) -> SectionMap:
     # Step 3: independently find P&L candidates by table structure
     structural = _structural_pl_candidates(doc)
 
-    # Merge — physical page numbers from headings and structural scan only
-    pl_pages    = sorted(set(headings["pl"] + structural))
-    bs_pages    = sorted(set(headings["bs"]))
-    cf_pages    = sorted(set(headings["cf"]))
-    notes_pages = sorted(set(headings["notes"]))
+    # Step 3b: text-scan fallback for titles that aren't font-sized headings
+    text_titles = _scan_page_text_titles(doc)
+
+    # Merge — physical page numbers from headings and structural scan; fall back
+    # to the page-text scan per section only when the primary path found nothing.
+    pl_pages    = sorted(set(headings["pl"] + structural)) or sorted(set(text_titles["pl"]))
+    bs_pages    = sorted(set(headings["bs"])) or sorted(set(text_titles["bs"]))
+    cf_pages    = sorted(set(headings["cf"])) or sorted(set(text_titles["cf"]))
+    notes_pages = sorted(set(headings["notes"])) or sorted(set(text_titles["notes"]))
 
     # Step 4: LLM tiebreak when multiple distinct P&L pages remain
     if len(pl_pages) > 1:
@@ -227,9 +321,11 @@ def run(doc: IngestedDocument) -> SectionMap:
     if not pl_pages:
         log.warning("No P&L page candidates found for %s", doc.source_path)
 
-    # Step 5: expand to continuation pages (multi-page statements)
+    # Step 5: expand to continuation pages (multi-page statements), bounded by the
+    # starts of other sections so it can't run to the end of a heading-less PDF.
     if pl_pages:
-        pl_pages = _expand_to_continuation_pages(doc, pl_pages[0])
+        boundaries = frozenset(bs_pages + cf_pages + notes_pages)
+        pl_pages = _expand_to_continuation_pages(doc, pl_pages[0], boundary_pages=boundaries)
 
     # Notes range: first identified notes page to end of document
     if not notes_pages and pl_pages:
